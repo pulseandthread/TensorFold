@@ -390,3 +390,55 @@ def test_video_parts_are_refused_for_glm_with_a_clear_message():
                                              {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}]}]
     with pytest.raises(RequestError, match="video are unsupported"):
         prepare_images(frontend, messages, lambda template: "")
+
+
+def test_an_image_prefill_resumed_later_writes_the_same_absolute_rows():
+    torch = pytest.importorskip("torch")
+    from tensorfold.families.glm5_next.cuda.decode import _images
+    from tensorfold.vision.qwen_cuda import EncodedVision
+
+    rows = (20, 21, 22, 40)
+    features = torch.arange(len(rows), dtype=torch.float32)[:, None].expand(-1, 2) + 1
+    payload = EncodedVision(rows, features, None, 0)
+
+    def write(begin, chunk, shift=0):
+        x = torch.zeros((64, 2))
+        for start in range(begin, 64, chunk):
+            end = min(start + chunk, 64)
+            fn = _images(payload, start + shift, end - start)
+            if fn is not None:
+                fn(x[start:end], 1)
+        return x
+
+    fresh = write(0, 16)
+    for begin in (1, 16, 20):                      # a snapshot at or before the first image row
+        assert torch.equal(write(begin, 16), fresh), begin
+    # the pending MTP row of a snapshot that ends at the first image row (begin 20) reads next token 20: an image
+    # row, so the resume's absorb of prompt[19:21] must carry features; row 19 alone is text
+    assert _images(payload, 19, 2) is not None and _images(payload, 19, 1) is None
+
+
+def test_an_image_prefill_resumes_only_from_text_before_its_first_image_row():
+    from tensorfold.families.glm5_next.cuda.decode import Snapshot, prefill
+    from tensorfold.vision.qwen_cuda import EncodedVision
+
+    payload = EncodedVision((20, 21), None, None, 0)
+    prompt = list(range(1, 40))
+    past = Snapshot(prompt[:21], None, None, None, -1, -1)         # ends past the first image row (20)
+    with pytest.raises(ValueError, match="before its first image row"):
+        prefill(None, prompt, None, resume=past, vision=payload)
+    with pytest.raises(ValueError, match="before the first image row|only the text"):
+        prefill(None, prompt, None, keep_at=21, keep=lambda s: None, vision=payload)
+
+
+def test_hit_selection_for_an_image_prompt_ignores_snapshots_past_the_first_image_row():
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    prompt = list(range(1, 60))
+    snaps = [SimpleNamespace(ids=prompt[:n], drafter_end=-1, mtp_len=n - 1) for n in (10, 20, 30, 58)]
+    fake = SimpleNamespace(cache=snaps, _drafters=lambda code: (False, True, False))
+    pick = lambda limit: GlmEngine._resume(fake, prompt, [0], limit)
+    assert len(pick(None).ids) == 58                 # a text prompt takes the longest
+    assert len(pick(25).ids) == 20                   # an image at row 25 skips the 30- and 58-token snapshots
+    assert len(pick(20).ids) == 20                   # a snapshot ending at the first image row is allowed
+    assert pick(5) is None

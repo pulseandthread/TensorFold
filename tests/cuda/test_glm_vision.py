@@ -127,3 +127,70 @@ def test_a_long_image_prompt_replies_as_its_text_twin(engine_long, sampling):
 def test_a_server_without_the_tower_refuses_images(engine):
     with pytest.raises(ValueError, match="--vision"):
         engine.generate([1, 2, 3], 4, None, lambda new: None, vision=object())
+
+
+@pytest.mark.parametrize("begin", [16, 20], ids=["mid-text", "at-first-image-row"])
+def test_a_resumed_image_prefill_equals_a_fresh_one(engine, begin):
+    from tensorfold.families.glm5_next.cuda.decode import Engine, prefill
+
+    text, image = _prompts()
+    payload = EncodedVision(ROWS, _features(engine, [text[i] for i in ROWS]), None, 0)
+    kept = []
+    src = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    prefill(src, text[:begin + 1], None, keep_at=begin, keep=kept.append)
+    snap, = kept
+    fresh = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    first = prefill(fresh, image, None, vision=payload)
+    want = [t.clone() for t in _state(fresh)]
+    e = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    assert prefill(e, image, None, vision=payload, resume=snap) == first
+    assert all(torch.equal(a, b) for a, b in zip(_state(e), want))
+    # keeping the text before the first image row works; keeping past it is refused
+    again = []
+    e = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    prefill(e, image, None, vision=payload, keep_at=ROWS[0], keep=again.append)
+    assert again and again[0].ids == image[:ROWS[0]]
+    with pytest.raises(ValueError):
+        prefill(e, image, None, vision=payload, keep_at=ROWS[0] + 1, keep=again.append)
+
+
+def test_a_resume_past_an_image_row_is_refused(engine):
+    from tensorfold.families.glm5_next.cuda.decode import Engine, prefill
+
+    text, image = _prompts()
+    payload = EncodedVision(ROWS, _features(engine, [text[i] for i in ROWS]), None, 0)
+    kept = []
+    src = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    prefill(src, text[:ROWS[0] + 6], None, keep_at=ROWS[0] + 5, keep=kept.append)
+    e = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    with pytest.raises(ValueError, match="first image row"):
+        prefill(e, image, None, vision=payload, resume=kept[0])
+
+
+@pytest.mark.parametrize("sampling", [Sampling(5, 1.0, 20, 0.95), None], ids=["sampled", "greedy"])
+def test_an_image_request_resumes_a_kept_text_prefix_and_keeps_the_one_before_its_image(engine, sampling):
+    text, image = _prompts()
+    features = _features(engine, [text[i] for i in ROWS])
+    engine.vision = SimpleNamespace(encode=lambda prepared, prompt: EncodedVision(ROWS, features, None, 0))
+    engine.image_token = IMAGE
+
+    def ask():
+        out: list[int] = []
+        engine.request.policy, engine.request.stop_eos = None, False
+        stats = engine.generate(list(image), 24, sampling, out.extend, vision=object())
+        return out, stats
+
+    try:
+        _forget(engine)
+        want, stats = ask()                                     # no snapshot: fresh, keeps the text before row 20
+        assert stats["cached"] == 0 and [list(c.ids) for c in engine.cache] == [image[:ROWS[0]]]
+        again, stats = ask()                                    # now resumes from it
+        assert again == want and stats["cached"] == ROWS[0]
+        _forget(engine)
+        _generate(engine, text[:ROWS[0] + 11], sampling)         # a text turn kept text[:ROWS[0] + 10]: past the image row
+        assert [len(c.ids) for c in engine.cache] == [ROWS[0] + 10]
+        got, stats = ask()                                      # not a candidate: fresh, same reply
+        assert got == want and stats["cached"] == 0
+    finally:
+        engine.vision = engine.image_token = None
+        _forget(engine)

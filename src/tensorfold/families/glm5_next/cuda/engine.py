@@ -388,14 +388,16 @@ class GlmEngine:
         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
         return auto, auto or not dflash, dflash
 
-    def _resume(self, prompt: list[int], code: list[int]):
-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
+    def _resume(self, prompt: list[int], code: list[int], limit: int | None = None):
+        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters.
+
+        ``limit`` (an image prompt's first image row) excludes snapshots longer than it: image rows are no token ids."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
         for snap in self.cache:
             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
-            if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+            if fits and len(snap.ids) < len(prompt) and (limit is None or len(snap.ids) <= limit) and prompt[:len(snap.ids)] == snap.ids and (
                     best is None or len(snap.ids) > len(best.ids)):
                 best = snap
         return best
@@ -484,9 +486,13 @@ class GlmEngine:
             hit.rows, hit.nbytes = None, 0            # live again
         # the caches' rows by id; an image row is no token id, so no kept text prompt matches it
         self.live = list(prompt) if vision is None else [-1 if t == self.image_token else t for t in prompt]
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft and vision is None else None, keep=self._remember,
-                        vision=vision)
+        if vision is None:
+            keep_at = max(1, len(prompt) - 1) if draft else None
+        else:         # the text before the first image row is worth keeping; nothing past an image row is
+            point = vision.rows[0]
+            keep_at = point if draft and point >= 1 and (hit is None or len(hit.ids) < point) else None
+        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, keep_at=keep_at,
+                        keep=self._remember, vision=vision)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens = StopVote(on_tokens, self._gather_ints)        # both ranks stop where rank 0's caller asks
@@ -540,9 +546,10 @@ class GlmEngine:
             spec = getattr(self.request, "policy", None) or self.policy
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
-        # an image prompt is encoded before rank 1 is woken (a refused image never reaches it) and starts fresh
+        # an image prompt is encoded before rank 1 is woken (a refused image never reaches it); it resumes only a text
+        # prefix that ends at or before its first image row
         encoded = self.vision.encode(vision, prompt) if vision is not None else None
-        hit = self._resume(list(prompt), code) if draft and encoded is None else None
+        hit = self._resume(list(prompt), code, encoded.rows[0] if encoded is not None else None) if draft else None
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,

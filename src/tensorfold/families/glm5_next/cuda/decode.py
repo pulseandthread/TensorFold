@@ -346,8 +346,14 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
-    if vision is not None and (resume is not None or keep_at is not None):
-        raise ValueError("image prompts require a fresh cache and keep no prompt state")
+    if vision is not None:
+        # image rows are not token ids: only a text prefix that ends at or before the first placeholder row may be
+        # resumed or kept (the rows' features are written by absolute prompt row, so a later begin is exact)
+        first_row = vision.rows[0]
+        if resume is not None and len(resume.ids) > first_row:
+            raise ValueError("an image prompt resumes only from a snapshot that ends before its first image row")
+        if keep_at is not None and keep_at > first_row:
+            raise ValueError("an image prompt keeps only the text before its first image row")
     w, st, b = e.w, e.st, e.pbuf
     use_mtp = mtp and w.mtp is not None
     begin = 0
@@ -364,7 +370,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         restore(e, resume, drafter)
         if use_mtp:
             k = resume.pending.shape[0]
-            _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
+            # the pending row's next token is prompt[begin], which may be the first image row
+            _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]),
+                         _images(vision, begin - k + 1, k))
     from .forward import Cut
 
     if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
