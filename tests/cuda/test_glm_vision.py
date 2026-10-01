@@ -67,7 +67,7 @@ def test_image_rows_reach_the_model_and_the_mtp_head(engine):
 
 
 @pytest.mark.parametrize("sampling", [Sampling(77, 1.0, 20, 0.95), None], ids=["sampled", "greedy"])
-def test_an_image_request_replies_as_its_text_twin_and_keeps_no_state(engine, sampling):
+def test_an_image_request_replies_as_its_text_twin_and_keeps_only_the_text_before_it(engine, sampling):
     text, image = _prompts()
     features = _features(engine, [text[i] for i in ROWS])
     encoded = []
@@ -83,7 +83,9 @@ def test_an_image_request_replies_as_its_text_twin_and_keeps_no_state(engine, sa
         engine.request.policy, engine.request.stop_eos = None, False
         stats = engine.generate(list(image), 24, sampling, out.extend, vision=object())
         assert out == want and stats["cached"] == 0 and encoded == [image]
-        assert [list(c.ids) for c in engine.cache] == kept        # no image prompt state is kept
+        # the text before the first image row is kept (glm-vision-resume); nothing past it
+        before = list(image[:ROWS[0]])
+        assert sorted(map(tuple, (list(c.ids) for c in engine.cache))) == sorted(map(tuple, kept + [before]))
         again, stats = _generate(engine, text, sampling)           # the text prompt still resumes, same reply
         assert again == want and stats["cached"] > 0
     finally:
@@ -142,7 +144,7 @@ def test_a_resumed_image_prefill_equals_a_fresh_one(engine, begin):
     fresh = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
     first = prefill(fresh, image, None, vision=payload)
     want = [t.clone() for t in _state(fresh)]
-    e = Engine(engine.w, capacity=2560, max_rows=8, prefill_rows=16)
+    e = src                                   # a snapshot resumes in the engine that kept it (as the server does)
     assert prefill(e, image, None, vision=payload, resume=snap) == first
     assert all(torch.equal(a, b) for a, b in zip(_state(e), want))
     # keeping the text before the first image row works; keeping past it is refused
